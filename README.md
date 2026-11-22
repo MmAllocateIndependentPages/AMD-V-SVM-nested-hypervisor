@@ -1,48 +1,86 @@
 # svmb
 
-windows kernel driver that flips your cpu into AMD SVM mode when it loads and uses that to mess with memory and syscalls. started as me poking at svm, turned into a sandbox i kept bolting things onto.
+AMD-V (SVM) nested hypervisor research driver for Windows. Virtualizes every core at DriverEntry and uses the hypervisor position to implement NPT memory virtualization, page hooks, CR3 protection, syscall sensing, memory encryption, and crash forensics.
 
-heads up this will bsod you. run it in a vm you don't care about.
+## Features
 
-## what it does
+### Virtualization
+- All-core SVM at DriverEntry with single-phase unload.
+- NPT identity map across `[0, RamEnd)` with 2M RWX large pages, MMIO holes handled.
+- Configurable TLB flush modes (`TlbMode=0` flush-all per VMRUN, `TlbMode=1` never flush).
 
-virtualizes every core the second the driver loads. identity-mapped NPT with 2M pages, mmio holes handled. then a pile of toys on top.
+### NPT Page Hooks
+- Execute/data view transitions per 4K page.
+- Stub + callback layers for managed hook registration.
+- Stolen-prefix ASM detour; works on real kernel exports (e.g. `NtCreateFile`).
 
-NPT hook thing that flips pages between execute and data so you can intercept kernel functions. tried it on NtCreateFile with a stolen prefix detour, worked first try which i did not expect.
+### CR3 Protection Suite
+- **Sentinel sensing:** NPT W-deny on thread-object pages of watched processes; one trap per schedule write with direction bit.
+- **Per-core process views:** publishes a per-process NCr3 on the core while the target is current (base for policy-driven hiding).
+- **CR3 read spoofing:** XOR-key disguise. Bare-metal only, nested virt does not forward the intercept.
+- **Region write protection:** `cr3 protect/unprotect/holdpage/regions` combining L1 guest-MM blocking with L2 NPT sensing; MDL-bypass probe; shadow-kick wiggle for deterministic single-exit sensing; dead-process sweep.
 
-CR3 stuff is three things. one, deny-writes thread object pages of watched processes so every schedule-in traps and you get a direction bit out of it. two, per core NCr3 so each core sees its own view of a process while that process is running on it. three, CR3 read spoof with an XOR key but that one's bare metal only, nested virt just swallows the intercept.
+### sysaudit (syscall / exec sensing)
+- X-denies entry pages of `MmCopyVirtualMemory`, `NtCreateFile`, `NtOpenProcess`, `NtReadVirtualMemory`, `NtWriteVirtualMemory`.
+- SSDT + SSN anchored, multi-anchor validated.
+- Entry-fetch NPF records caller pid, image, and arguments.
+- Page is reopened and the original instruction re-executes natively.
+- 250 ms timer re-arms deny.
+- Zero guest bytes modified by construction (PatchGuard-invisible).
 
-sysaudit is the one i had the most fun writing. X-denies the entry pages of MmCopyVirtualMemory, NtCreateFile, NtOpenProcess, NtReadVirtualMemory, NtWriteVirtualMemory. something calls one, NPF on the entry fetch, you grab caller pid and image and args, reopen the page, let the original instruction run. not one byte of guest memory gets touched. PatchGuard sees nothing because there's nothing to see.
+### Behavior Analytics
+- 1 second window per-(caller, target) cross-process call rate tables.
+- Edge-triggered alerts; thresholds set via registry knobs.
+- Live RD / WR / OP tables.
 
-on top of that a 1 second window rate table per (caller, target) with edge triggered alerts. trip a threshold and it can suspend the offender (reversibly) or kill it. off by default behind registry knobs because you really don't want this killing random processes at 2am while you're debugging something unrelated. ask me how i know.
+### Alert Response
+- Reversible suspend of offending processes.
+- Deny-list.
+- Kill-time live-EPROCESS image re-verify.
+- Off by default (`BehaveResponse` knob).
 
-mem_crypt is the weird one. dual frame split view. the target process reads and writes plaintext through its own NPT. the physical frame underneath is XOR keystream ciphertext. anyone else walks physical memory, anyone else's view of that page is ciphertext. the seal is two phases with the target frozen across the transition so you never catch half a seal. unload puts the plaintext back without needing to stash a key.
+### mem_crypt (memory-block encryption)
+- Dual-frame split view: each protected block page maps to a private plaintext copy on the target's NPT view; the original frame holds XOR-keystream ciphertext.
+- Target reads and writes plaintext; every other observer (physical walk, scanners, other processes) sees ciphertext.
+- Two-phase seal gated by an exit-generation fence, target frozen across the transition.
+- Key-free decrypt and unload-time restore.
+- Per-core view sync via intercepted CPUID at block-access points (see `tests/mcrypt_target.c`).
 
-lock free breadcrumb ring for crash stuff. live IOCTL reads it, there's also an offline decoder that works on suspended RAM dumps from vmware. probably the single most useful piece of code in here just because of how many times it told me where things died.
+### Crash Forensics
+- Lock-free breadcrumb flight recorder.
+- Live IOCTL reader + offline suspended-RAM decoder (`tools/decode_vmss_crumbs.py`).
+- kdump helper.
 
-svmbctl is the usermode cli. info, start, stop, storm, cr3 commands, exitprof, dbg, sysaudit, kdump, crumbs.
+### Module System
+- Function-table API for pluggable modules.
+- Shipped modules: debugger, cr3_monitor, cr3_seed, sysaudit, stealth, mem_read, mem_crypt, npt_hook_mgr, dbg_events, demo_cpuid.
 
-## what works where
+### Control Tool (`svmbctl`)
+- `info`, `start`, `stop`, `storm`
+- `cr3 protect/unprotect/holdpage/regions/probe`
+- `exitprof`
+- `dbg` commands
+- `sysaudit` config and readout
+- `kdump`, `crumbs`
 
-vmware with nested virt on, that's all i've tested. haven't touched real AMD silicon yet. offsets hardcoded to windows 10 1903 (18362). test signing only, no microsoft signature. the IOCTLs don't check anything so anyone who can open the device can drive all of it. fine for a research box, obviously not something you'd ship.
+## Scope & Status
+- Target: Windows 10 1903 (build 18362). Offsets are hardcoded to that build.
+- Tested under VMware with nested virtualization enabled.
+- Real AMD hardware not yet verified.
+- No Microsoft signature; test-signing certificate only.
+- IOCTLs have no permission model.
 
-## building
+## Build
+Open `svmb.sln` in Visual Studio with the WDK installed, build x64. Enable test-signing on the target (`bcdedit /set testsigning on`). The `build/` directory contains deployment and crash-pull scripts used during development.
 
-open svmb.sln in VS with the WDK installed, build x64. on the test machine `bcdedit /set testsigning on` and reboot.
+## Documentation
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/MODULE_GUIDE.md](docs/MODULE_GUIDE.md)
+- [docs/MEM_CRYPT.md](docs/MEM_CRYPT.md)
+- [docs/HYPERVISOR_MEM_READ.md](docs/HYPERVISOR_MEM_READ.md)
+- [docs/L2_BLOCKING_DESIGN.md](docs/L2_BLOCKING_DESIGN.md)
+- [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md)
+- [tests/CRASH_DEBUG_LOG.md](tests/CRASH_DEBUG_LOG.md)
 
-the `build/` folder has a bunch of bat files i wrote for shoving the driver into a VM and pulling crash dumps back out. they're hardcoded to my paths, treat them as hints.
-
-## docs
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) how it fits together
-- [docs/MODULE_GUIDE.md](docs/MODULE_GUIDE.md) module system
-- [tests/CRASH_DEBUG_LOG.md](tests/CRASH_DEBUG_LOG.md) round by round debug history, more fun to read than most of the code tbh
-- [AGENTS.md](AGENTS.md) rules for when i had AI helping with bringup
-
-## license
-
-MIT
-
-## last thing
-
-like i said, run it in a vm you don't care about.
+## License
+MIT. See [LICENSE](LICENSE).
