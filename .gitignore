@@ -1,0 +1,52 @@
+# Build outputs
+build/*/
+driver/x64/
+driver/Debug/
+driver/Release/
+app/x64/
+app/Debug/
+app/Release/
+tests/x64/
+tests/Debug/
+tests/Release/
+x64/
+Debug/
+Release/
+
+# MSVC / WDK artifacts
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.ipdb
+*.iobj
+*.tlog
+*.log
+*.lastbuildstate
+*.unsuccessfulbuild
+*.recipe
+*.cache
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.aps
+*.ncb
+*.VC.db
+*.VC.VC.opendb
+
+# WDK driver signing artifacts
+*.cer
+*.pfx
+*.cat
+*.inf.pdb
+
+# VS folders
+.vs/
+.vscode/
+
+# OS
+Thumbs.db
+desktop.ini
+*.lnk
